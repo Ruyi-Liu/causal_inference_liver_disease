@@ -1,0 +1,606 @@
+---
+title: "BIS 537 Final Project"
+author: "Ruyi Liu, Jingchen Liang"
+date: '2022-12-01'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(corrplot)
+library(MASS)
+library(PSweight)
+library(VGAM)
+library(brglm2)
+library(mvtnorm)
+library(randomForest)
+library(DMwR)
+library(latex2exp)
+```
+
+
+# Part 0. Data Import
+
+```{r, warning=FALSE, message=FALSE}
+# load data
+# data link: https://www.kaggle.com/datasets/kartik2khandelwal/no-title
+liver <- read.csv("liver.csv",na.strings = c("", "NA"))
+dim(liver)  ## 6800 obs & 20 cols
+colnames(liver)
+```
+
+# Part 1. Data Preprocessing
+
+```{r}
+# delete all observations when drug (Z) is missing
+liver1 <- liver[which(!is.na(liver$Drug)),]
+
+# each patient only has one record
+length(unique(liver1$ID))  
+
+colSums(is.na(liver1))
+# select variables
+liver2 <- liver1[,c("Drug","Age","Sex","Hepatomegaly","Edema","Bilirubin","Albumin","SGOT","Platelets","Prothrombin","Stage")]
+liver3 <- liver2[complete.cases(liver2), ]   # 1995 obs & 11 cols
+dim(liver3)
+table(liver3$Stage)
+
+# reformat the variables
+liver3$Drug <- ifelse(liver3$Drug == "D-penicillamine", 1, 0)   # D-penicillamine = 1, placebo = 0
+liver3$Sex <- ifelse(liver3$Sex == "F", 1, 0)  # F = 1, M = 0
+liver3$Hepatomegaly <- ifelse(liver3$Hepatomegaly == "Y", 1, 0)  # Y = 1, N = 0
+liver3$Edema <- ifelse(liver3$Edema == "N", 1, 0)  # Y = 1, N = 0
+liver3$Age <- ceiling(liver3$Age/365)
+```
+
+
+```{r}
+liver_final <- liver3
+# check correlations
+liver_Cor <- cor(liver_final[,c(2,6:10)])
+##Visualize correlations
+corrplot.mixed(liver_Cor, tl.col="black", tl.pos = "lt")    # correlations are low
+```
+
+
+# Part 2. Propensity Score Analysis
+
+__1. Direct regression estimator__ 
+
+We use random forest algorithm to find the direct regression estimator. By definition, the regression estimator for ATE is 
+$$\hat{\tau}^{ATE}= N^{-1}\sum_{i=1}^{N}(\hat{m}_1(X_i)-\hat{m}_0(X_i))$$ 
+
+```{r,warning=FALSE,message=FALSE}
+## direct regression estimator
+# use random forest
+set.seed(60)
+liver_final1 <- liver_final
+liver_final1$Stage_binary <- ifelse(liver_final$Stage == 4, 1, 0)
+liver_final1$Stage <- NULL
+liver_final_1 <- subset(liver_final1, liver_final1$Drug == 1)
+liver_final_0 <- subset(liver_final1, liver_final1$Drug == 0)
+# regression among the untreated Z = 0
+model_a0 <- glm(as.factor(Stage_binary) ~., family = binomial,data = liver_final_0)
+mu_hat_a0 <- predict(model_a0,newdata=liver_final1,type="response")
+# regression among the untreated Z = 1
+model_a1 <- glm(as.factor(Stage_binary) ~., family = binomial,data = liver_final_1)
+mu_hat_a1 <- predict(model_a1,newdata=liver_final1,type="response")
+
+# estimate the ATE
+ATE_direct <- sum(as.numeric(mu_hat_a1)-as.numeric(mu_hat_a0))/nrow(liver_final1)
+ATE_direct
+
+# estimate the risk ratio
+RR_direct <- mean(mu_hat_a1)/mean(mu_hat_a0)
+RR_direct
+```
+
+
+
+```{r,warning=FALSE,message=FALSE}
+# use bootstrap to find the standard error
+set.seed(60)
+n <- nrow(liver_final)
+# perform 1000 bootstrap simulations
+B <- 1000
+idx <- 1:nrow(liver_final)
+ATT_direct_estimates <- c()
+RR_direct_estimates <- c()
+for(i in 1:B){
+  sample_index <- sample(idx, n, replace=TRUE)
+  new_sample <- liver_final[sample_index,]
+  new_sample_1 <- subset(liver_final1, liver_final1$Drug == 1)
+  new_sample_0 <- subset(liver_final1, liver_final1$Drug == 0)
+  # regression among the untreated Z = 0
+  model_a0 <- glm(as.factor(Stage_binary) ~., family = binomial,data = new_sample_0)
+  mu_hat_a0 <- predict(model_a0,newdata=new_sample,type="response")
+  # regression among the untreated Z = 1
+  model_a1 <- glm(as.factor(Stage_binary) ~., family = binomial,data = new_sample_1)
+  mu_hat_a1 <- predict(model_a1,newdata=new_sample,type="response")
+  ATT_direct_estimates[i] <- sum(as.numeric(mu_hat_a1)-as.numeric(mu_hat_a0))/nrow(new_sample)
+  RR_direct_estimates[i] <- mean(mu_hat_a1)/mean(mu_hat_a0)
+}
+sd(ATT_direct_estimates)
+sd(RR_direct_estimates)
+```
+
+The estimated ATE using direct regression estimator is 0.008289998, and its standard error is 0.001075567.  
+The estimated risk ratio using direct regression estimator is 1.01624, and its standard error is 0.00212431.    
+
+
+__2. IPW with normalized weights__ 
+
+
+```{r}
+liver_final1 <- liver_final
+liver_final1$Stage_binary <- ifelse(liver_final$Stage == 4, 1, 0)
+liver_final1$Stage <- NULL
+# run a logistic regression model with all pre-treatment variable
+logit_model1 = glm(Drug ~. - Stage_binary, family = "binomial",data = liver_final1)
+# get the propensity score
+propensity_score1 = predict(logit_model1, type = "response")
+result1 = data.frame(liver_final1,propensity_score=propensity_score1)
+# find inverse probability weighting (IPW) for Z = 1 (W1) and Z = 0 (W0)
+result1$IPW = ifelse(result1$Drug == 0, 1/(1-propensity_score1), 1/propensity_score1)
+head(result1)
+```
+
+```{r}
+# subset the result data
+# for Z = 0
+result1_Z0 = subset(result1,result1$Drug == 0)
+# for Z = 1
+result1_Z1 = subset(result1,result1$Drug == 1)
+# get the unweighted and weighted variance for each variable
+s0 = apply(result1_Z0[2:12], 2, var)
+s1 = apply(result1_Z1[2:12], 2, var)
+# calculate the absolute standardized difference (ASD) for each variable
+pre_var_list = colnames(result1)[2:12]
+ASD = c()
+for(i in 1:length(pre_var_list)){
+ ASD[i] = abs(sum(result1_Z1$IPW*result1_Z1$Drug*result1_Z1[pre_var_list[i]])/sum(result1_Z1$IPW*result1_Z1$Drug) -
+ sum(result1_Z0$IPW*(1-result1_Z0$Drug)*result1_Z0[pre_var_list[i]])/sum(result1_Z0$IPW*(1-result1_Z0$Drug)))/
+ sqrt((s0[pre_var_list[i]]+s1[pre_var_list[i]])/2)
+}
+# show results
+ASD_res = data.frame(pre_var_list,ASD)
+ASD_res
+```
+
+```{r}
+# plot the histogram
+ggplot(result1, aes(x = propensity_score)) +
+ geom_histogram(aes(color = factor(Drug), fill = factor(Drug)),
+ position = "identity", bins = 30, alpha = 0.3) +
+ labs(title="Overlaying Histogram of the Estimated Propensity Scores by Treatment Groups",
+ color="Drug",fill="Drug",x="propensity score") + theme_bw()
+```
+
+```{r, fig.width=12,fig.height=11.5, fig.asp = .5}
+# plot the loveplot for the weighted ASD
+summary_PS <- SumStat(ps.formula = Drug ~ Age+Sex+Hepatomegaly+Edema+Bilirubin+Albumin+SGOT+Platelets+Prothrombin, 
+                      data = liver_final1, weight = "IPW")
+plot(summary_PS, type = "balance", metric = "ASD",threshold = 0.1) # based on ASD
+```
+
+The histogram shows a satisfactory overlap of propensity scores between treatment groups.From the love plot, we find that the unweighted mean differences of the original ASD are larger than the values of IPW. Of these three methods, the IPW keeps each mean difference below 0.1, and the ASD of each covariate is close to 0, which provides the best balance.
+
+
+
+Given $w_1(X_i)=\frac{h(X_i)}{e(X_i)}$, and $w_0(X_i)=\frac{h(X_i)}{1-e(X_i)}$, and by the definition of IPW, since $w_1(X_i)=\frac{1}{e(X_i)}$, and $w_0(X_i)=\frac{1}{1-e(X_i)}$, so $h(X_i) = 1$ 
+
+
+```{r}
+# Estimate the ATE
+# get w1 and w0
+w1 = 1/result1$propensity_score
+w0 = 1/(1-result1$propensity_score)
+# find the ATE for using non-normalized weights
+ATT_IPW_normalized = sum(w1*result1$Drug*result1$Stage_binary)/sum(w1*result1$Drug)-
+ sum(w0*(1-result1$Drug)*result1$Stage_binary)/sum(w0*(1-result1$Drug))
+ATT_IPW_normalized
+RR_IPW_normalized <- (sum(w1*result1$Drug*result1$Stage_binary)/sum(w1*result1$Drug))/(sum(w0*(1-result1$Drug)*result1$Stage_binary)/sum(w0*(1-result1$Drug)))
+RR_IPW_normalized
+```
+
+
+```{r}
+# use bootstrap to find the standard error
+set.seed(100)
+n = nrow(liver_final1)
+# perform 1000 bootstrap simulations
+B = 1000
+idx = 1:nrow(liver_final1)
+ATT_estimate_IPW = c()
+RR_estimate_IPW = c()
+for(i in 1:B){
+ sample_index = sample(idx, n, replace=TRUE)
+ new_sample = liver_final1[sample_index,]
+ model = glm(Drug ~. - Stage_binary, family = "binomial",data = new_sample)
+ new_sample$propensity_score = predict(model,data=new_sample,type = "response")
+ # get w1 and w0
+ w1 = 1/new_sample$propensity_score
+ w0 = 1/(1-new_sample$propensity_score)
+ ATT_estimate_IPW[i] = sum(w1*new_sample$Drug*new_sample$Stage_binary)/sum(w1*new_sample$Drug)-
+ sum(w0*(1-new_sample$Drug)*new_sample$Stage_binary)/sum(w0*(1-new_sample$Drug))
+ RR_estimate_IPW[i] = (sum(w1*new_sample$Drug*new_sample$Stage_binary)/sum(w1*new_sample$Drug))/(sum(w0*(1-new_sample$Drug)*new_sample$Stage_binary)/sum(w0*(1-new_sample$Drug)))
+}
+sd(ATT_estimate_IPW)
+sd(RR_estimate_IPW)
+```
+
+
+The estimated ATE using IPW estimate using normalized weights is 0.008676144, and its standard error is 0.02264897.  
+The estimated risk ratio using IPW estimate using normalized weights is 1.016999, and its standard error is 0.04505959.      
+
+
+
+
+__3. Doubly-Robust estimator__ 
+
+According to the notes in Lecture 7, we have doubly robust estimator is:  
+
+$$
+\begin{aligned}
+\hat {\tau}_{dr} = \frac{1}{N}\sum_{i=1}^{N} \left[\hat{m}_1(X_i)+\frac{Z_i(Y_i-\hat{m_1}(X_i))}{\hat{e}(X_i)} \right] -\frac{1}{N}\sum_{i=1}^{N} \left[\hat{m}_0(X_i)+\frac{(1-Z_i)(Y_i-\hat{m_0}(X_i))}{1-\hat{e}(X_i)} \right]
+\end{aligned}
+$$
+
+```{r,warning=FALSE,message=FALSE}
+# first run a logistic regression model to get the propensity score
+model_DR = glm(Drug ~. - Stage_binary, family = "binomial",data = liver_final1)
+# get the propensity score
+propensity_score_DR = predict(model_DR, type = "response")
+# subset the data by treatment
+liver_final_1 = subset(liver_final1, liver_final1$Drug == 1)
+liver_final_0 = subset(liver_final1, liver_final1$Drug == 0)
+# fit regression models based on the observed outcome in each treatment group
+model_1 = glm(Stage_binary ~., family = "binomial",data = liver_final_1)
+model_0 = glm(Stage_binary ~., family = "binomial",data = liver_final_0)
+# get outcome prediction for Z = 1
+prediction_1 = predict(model_1, type="response",newdata=liver_final1)
+# get outcome prediction for Z = 0
+prediction_0 = predict(model_0, type="response",newdata=liver_final1)
+# find the ATE - risk difference
+ATE_DR = sum(prediction_1+liver_final1$Drug*(liver_final1$Stage_binary-prediction_1)/propensity_score_DR)/nrow(liver_final1)-
+      sum(prediction_0+(1-liver_final1$Drug)*(liver_final1$Stage_binary-prediction_0)/(1-propensity_score_DR))/nrow(liver_final1)
+ATE_DR
+RR_DR = (sum(prediction_1+liver_final1$Drug*(liver_final1$Stage_binary-prediction_1)/propensity_score_DR)/nrow(liver_final1))/(sum(prediction_0+(1-liver_final1$Drug)*(liver_final1$Stage_binary-prediction_0)/(1-propensity_score_DR))/nrow(liver_final1))
+RR_DR
+```
+
+```{r,warning=FALSE,message=FALSE}
+# use bootstrap to find the standard error for RD and RR using IPW
+set.seed(100)
+n = nrow(liver_final1)
+# perform 1000 bootstrap simulations
+B = 1000
+idx = 1:nrow(liver_final1)
+ATE_boot_IPW = c()
+RR_boot_IPW = c()
+for(i in 1:B){
+  sample_index = sample(idx, n, replace=TRUE)
+  new_sample = liver_final1[sample_index,]
+  model_g = glm(Drug ~. - Stage_binary, family = "binomial",data = new_sample)
+  # get the propensity score
+  propensity_score_DR = predict(model_DR, type = "response")
+  # subset the data by treatment
+  liver_final_1 = subset(new_sample, new_sample$Drug == 1)
+  liver_final_0 = subset(new_sample, new_sample$Drug == 0)
+  # fit regression models based on the observed outcome in each treatment group
+  model_1 = glm(Stage_binary ~., family = "binomial",data = liver_final_1)
+  model_0 = glm(Stage_binary ~., family = "binomial",data = liver_final_0)
+  # get outcome prediction for Z = 1
+  prediction_1 = predict(model_1, type="response",newdata=new_sample)
+  # get outcome prediction for Z = 0
+  prediction_0 = predict(model_0, type="response",newdata=new_sample)
+  # find the ATE - risk difference
+  ATE_boot_IPW[i] = sum(prediction_1+new_sample$Drug*(new_sample$Stage_binary-prediction_1)/propensity_score_DR)/nrow(new_sample)-
+        sum(prediction_0+(1-new_sample$Drug)*(new_sample$Stage_binary-prediction_0)/(1-propensity_score_DR))/nrow(new_sample)
+  RR_boot_IPW[i] = (sum(prediction_1+new_sample$Drug*(new_sample$Stage_binary-prediction_1)/propensity_score_DR)/nrow(new_sample))/(sum(prediction_0+(1-new_sample$Drug)*(new_sample$Stage_binary-prediction_0)/(1-propensity_score_DR))/nrow(new_sample))
+}
+sd(ATE_boot_IPW)
+sd(RR_boot_IPW)
+```
+
+
+The estimated ATE using doubly-Robust estimator is 0.008913068, and its standard error is 0.02284838.  
+The estimated risk ratio using doubly-Robust estimator is 1.017467, and its standard error is 0.04544266.        
+
+```{r}
+# sensitivity analysis
+1.01747 - qnorm(0.975)*0.04544266
+1.01747 + qnorm(0.975)*0.04544266
+```
+
+
+
+__4. Propensity score stratification__ 
+
+
+```{r}
+logit_model2 = glm(Drug ~. - Stage_binary, family = "binomial",data = liver_final1)
+# get the propensity score
+propensity_score2 = predict(logit_model2, type = "response",liver_final1)
+result2 = data.frame(liver_final1,propensity_score = propensity_score2)
+# stratification method - cut the propensity scores into 5 strata
+strata = cut(result2$propensity_score,breaks = quantile(c(0,result2$propensity_score), prob = seq(0,1,1/5),include.lowest = TRUE))
+# relevel the strata
+levels(strata) = c(1,2,3,4,5)
+Stage_4 <- liver_final$Stage
+result2 = data.frame(result2,strata,Stage_4)
+#p1_binary = c()
+#p2_binary = c()
+#OR_binary = c()
+# smaller than or equal to
+p11 <- c()
+p10 <- c()
+p21 <- c()
+p20 <- c()
+p31 <- c()
+p30 <- c()
+
+OR_1 <- c()
+OR_2 <- c()
+OR_3 <- c()
+# odds ratio pro cumulative prob
+for(i in 1:5){
+ strata_data = result2[result2$strata==i,]
+ p11[i] = nrow(strata_data[strata_data$Drug==1 & strata_data$Stage_4<=1,])/length(which(strata_data$Drug==1))
+ p10[i] = nrow(strata_data[strata_data$Drug==0 & strata_data$Stage_4<=1,])/length(which(strata_data$Drug==0))
+ p21[i] = nrow(strata_data[strata_data$Drug==1 & strata_data$Stage_4<=2,])/length(which(strata_data$Drug==1))
+ p20[i] = nrow(strata_data[strata_data$Drug==0 & strata_data$Stage_4<=2,])/length(which(strata_data$Drug==0))
+ p31[i] = nrow(strata_data[strata_data$Drug==1 & strata_data$Stage_4<=3,])/length(which(strata_data$Drug==1))
+ p30[i] = nrow(strata_data[strata_data$Drug==0 & strata_data$Stage_4<=3,])/length(which(strata_data$Drug==0))
+}
+
+OR_1 = (mean(p11)*(1-mean(p10)))/(mean(p10)*(1-mean(p11)))
+OR_1
+OR_2 = (mean(p21)*(1-mean(p20)))/(mean(p20)*(1-mean(p21)))
+OR_2
+OR_3 = (mean(p31)*(1-mean(p30)))/(mean(p30)*(1-mean(p31)))
+OR_3
+```
+
+
+# Part 3. Ordinal Logistic Regression
+
+```{r, warning=FALSE, message=FALSE}
+## fit ordered logit model
+# specify Hess=TRUE to have the model return the observed information matrix from optimization (called the Hessian) which is used to get standard errors.
+liver_final_ordinal <- liver_final
+liver_final_ordinal$Stage <- as.factor(liver_final_ordinal$Stage)
+levels(liver_final_ordinal$Stage) <- c("inflammation","fibrosis","cirrhosis","liver_failure")
+ordinal_reg <- polr(Stage ~ ., data = liver_final_ordinal, Hess=TRUE, method="probit")
+summary(ordinal_reg)
+table(predict(ordinal_reg))
+
+# find the p-values
+ctable <- coef(summary(ordinal_reg))
+p <- round(pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2,4)
+ctable <- cbind(ctable, "p value" = p)
+ctable
+# find the confidence interval
+ci <- confint(ordinal_reg)
+
+# find the odds ratios
+exp(coef(ordinal_reg))
+
+# odds ratios and CI
+exp(cbind(OR = coef(ordinal_reg), ci))
+```
+
+
+For patients whose use drug, the odds of being more likely to higher stage (i.e., cirrhosis or fibrosis versus inflammation) is 1.067 times that of patients using placebo, holding constant all other variables (not effective).
+
+
+```{r, warning=FALSE, message=FALSE}
+## fit ordered logit model if we scale the numeric variables - we obtain the same answers
+# specify Hess=TRUE to have the model return the observed information matrix from optimization (called the Hessian) which is used to get standard errors.
+liver_final_ordinal <- liver_final
+scale_liver <- data.frame(cbind(liver_final_ordinal[,c(1,3,4,5,11)],scale(as.matrix(liver_final_ordinal[,c(2,6:10)]))))
+head(scale_liver)
+
+scale_liver$Stage <- as.factor(scale_liver$Stage)
+levels(scale_liver$Stage) <- c("inflammation","fibrosis","cirrhosis","liver_failure")
+ordinal_reg <- polr(Stage ~ ., data = scale_liver, Hess=TRUE)
+summary(ordinal_reg)
+
+# find the p-values
+ctable <- coef(summary(ordinal_reg))
+p <- round(pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2,4)
+ctable <- cbind(ctable, "p value" = p)
+ctable
+# find the confidence interval
+ci <- confint(ordinal_reg)
+ci
+```
+
+
+```{r}
+# Y <= 1 | x = 1 / Y > 1 | x = 1
+exp(-2.6396)/exp(0.0650427)
+# Y <= 1 | x = 0 / Y > 1 | x = 0
+exp(-2.6396)
+# Y <= 2 | x = 1 / Y > 2 | x = 1
+exp(-0.9371)/exp(0.0650427)
+# Y <= 2 | x = 0 / Y > 2 | x = 0
+exp(-0.9371)
+# Y <= 3 | x = 1 / Y > 3 | x = 1
+exp(-0.1110)/exp(0.0650427)
+# Y <= 3 | x = 0 / Y > 3 | x = 0
+exp(-0.1110)
+
+# find odds ratio
+# 1 vs 2,3,4
+exp(-0.0650427)
+# 1,2 vs 3,4
+exp(-0.0650427)
+# 1,2,3 vs 4
+exp(-0.0650427)
+```
+
+
+# Part 4. Bayesian inference using Gibbs sampling
+
+```{r}
+a <- liver_final
+a1 <- subset(a,a$Stage == 3 | a$Stage == 4)
+a1$Sex <- as.factor(a1$Sex)
+a1$Hepatomegaly <- as.factor(a1$Hepatomegaly)
+a1$Edema <- as.factor(a1$Edema)
+a1$Stage <- as.factor(a1$Stage)
+new_df1 <- SMOTE(Stage ~., data = a1, perc.over = 600, perc.under = 100)
+a2 <- subset(a,a$Stage == 1 | a$Stage == 2)
+a2$Sex <- as.factor(a2$Sex)
+a2$Hepatomegaly <- as.factor(a2$Hepatomegaly)
+a2$Edema <- as.factor(a2$Edema)
+a2$Stage <- as.factor(a2$Stage)
+new_df2 <- SMOTE(Stage ~., data = a2, perc.over = 1600, perc.under = 100)
+new_df <- as.data.frame(rbind(new_df2,new_df1))
+liver_final_ordinal <- new_df
+table(liver_final_ordinal$Stage)
+liver_final_ordinal$Stage <- as.factor(liver_final_ordinal$Stage)
+levels(liver_final_ordinal$Stage) <- c("inflammation","fibrosis","cirrhosis","liver_failure")
+ordinal_reg <- polr(Stage ~ ., data = liver_final_ordinal, Hess=TRUE, method="logistic")
+summary(ordinal_reg)
+table(predict(ordinal_reg))
+```
+
+
+```{r}
+set.seed(60)
+new_df$Sex <- as.numeric(new_df$Sex)
+new_df$Hepatomegaly <- as.numeric(new_df$Hepatomegaly)
+new_df$Edema <- as.numeric(new_df$Edema)
+new_df$Stage <- as.numeric(new_df$Stage)
+
+scale_liver <- as.data.frame(scale(as.matrix(new_df[,c(2:10)])))
+scale_liver$Drug <- new_df$Drug
+scale_liver$Stage <- new_df$Stage
+n <- nrow(scale_liver)
+mc_num <- 10000
+X <- as.matrix(scale_liver[,1:10])
+beta <- matrix(0,nrow=mc_num,ncol=10)
+Z <- matrix(0,nrow=mc_num,ncol=n)
+Z_miss <- matrix(0,nrow=mc_num,ncol=n)
+Y_miss <- matrix(0,nrow=mc_num,ncol=n)
+test_stat1 <- rep(0,mc_num)
+test_stat2 <- matrix(0,nrow=mc_num,ncol=4)
+test_stat3 <- matrix(0,nrow=mc_num,ncol=4)
+
+# initialize values
+beta[1,] <- rep(2,10)
+Z[1,] <- rep(10,n)
+Z_miss[1,] <- rep(1,n)
+Y_miss[1,] <- rep(1,n)
+test_stat1[1] <- 1
+test_stat2[1,] <- rep(0.5,4)
+test_stat3[1,] <- rep(0.5,4)
+
+Z_miss_data <- scale_liver
+Z_miss_data$Drug <- ifelse(Z_miss_data$Drug == 0, 1, 0)
+Z_miss_data$Stage <- as.factor(Z_miss_data$Stage)
+for(i in 2:mc_num){
+  # update beta
+  beta[i,] <- rmvnorm(n=1,mean=(n/(n+1))*solve(t(X)%*%X)%*%t(X)%*%Z[i-1,],sigma=(n/(n+1))*solve(t(X)%*%X))
+  # update Z
+  for(j in 1:n){
+    # delta
+    Y_idx <- scale_liver[j,]$Stage
+    rest <- scale_liver[-j,]
+    maximum <- max(Z[i-1,][which(rest$Stage <= Y_idx)])
+    minimum <- min(Z[i-1,][which(rest$Stage >= Y_idx)])
+    delta <- ifelse(Z[i-1,j] >= maximum & Z[i-1,j] <= minimum, 1, 0)
+    Z[i,j] <- rnorm(n=1,mean=X[j,]%*%beta[i,],sd=1)*delta
+  }
+  # update Z_miss
+  for(k in 1:n){
+    Z_miss[i,k] <- as.matrix(Z_miss_data[,1:10][k,])%*%beta[i,] + rnorm(1,0,1)
+  }
+  # update Y_miss
+  X_beta <- c(as.matrix(scale_liver[,1:10])%*%beta[i,])
+  model <- polr(as.factor(scale_liver$Stage) ~ as.matrix(scale_liver[,1:10])%*%beta[i,], method = "probit")
+  Y_miss[i,] <- predict(model, newdata=Z_miss[i,])
+  
+  # update test statistics1
+  df_YZ <- as.data.frame(cbind(Y_obs = scale_liver$Stage, Y_mis = Y_miss[i,], Z_obs = scale_liver$Drug, Z_mis = 1-scale_liver$Drug))
+  Y_1 <- ifelse(df_YZ$Z_obs == 1,df_YZ$Y_obs,df_YZ$Y_mis)
+  Y_0 <- ifelse(df_YZ$Z_obs == 0,df_YZ$Y_obs,df_YZ$Y_mis)
+  df_potential_outcome <- as.data.frame(cbind(Y_1,Y_0))
+  mat_P <- matrix(0,4,4)
+  for(m in 1:4){
+    for (n in 1:4){
+      mat_P[m,n] <- nrow(df_potential_outcome[df_potential_outcome$Y_0==m & df_potential_outcome$Y_1==n,])/nrow(df_potential_outcome)
+    }
+  }
+  P_0_rowsum <- rowSums(mat_P)
+  P_1_colsum <- colSums(mat_P)
+  diff_mat_v <- as.matrix(P_1_colsum-P_0_rowsum)
+  test_stat1[i] <- norm(diff_mat_v, type="1")
+  
+  # update test statistics2 - distributional causal effect
+  for(u in 1:4){
+    test_stat2[i,u] <- nrow(df_potential_outcome[df_potential_outcome$Y_1 >= u,])/nrow(df_potential_outcome) - 
+      nrow(df_potential_outcome[df_potential_outcome$Y_0 >= u,])/nrow(df_potential_outcome)
+  }
+  # update test statistics3 - M-test
+  for(v in 1:4){
+    test_stat3[i,v] <- median(df_potential_outcome$Y_1[which(df_potential_outcome$Y_0 == v)])
+  }
+}
+```
+
+
+```{r}
+burnin <- 2000
+est1 <- mean(test_stat1[(burnin+1):10000],na.rm = T)
+sd1 <- sd(test_stat1[(burnin+1):10000],na.rm = T)
+quantile1 <- quantile(test_stat1[(burnin+1):10000],probs=c(0.025,0.5,0.975),na.rm = T)
+res_table1 <- as.data.frame(cbind(est1,sd1,quantile1[1],quantile1[2],quantile1[3]))
+colnames(res_table1) <- c("est","sd","lower","median","upper")
+
+est2 <- colMeans(test_stat2[(burnin+1):10000,])
+sd2 <- apply(test_stat2[(burnin+1):10000,],2,sd)
+quantile2 <- t(apply(test_stat2[(burnin+1):10000,],2,quantile, probs=c(0.025,0.5,0.975)))
+res_table2 <- as.data.frame(cbind(est2,sd2,quantile2))
+colnames(res_table2) <- c("est","sd","lower","median","upper")
+# create the table
+res_table <- rbind(res_table1,res_table2)
+rownames(res_table) <- c("Test_stat1","Test_stat2_1","Test_stat2_2","Test_stat2_3","Test_stat2_4")
+res_table
+```
+
+
+```{r}
+bayesian_res <- as.data.frame(cbind(test_stat1[(burnin+1):10000],test_stat2[(burnin+1):10000,]))
+colnames(bayesian_res) <- c("test_stat1","j = 1","j = 2","j = 3","j = 4")
+ggplot(bayesian_res, aes(x=test_stat1)) + geom_histogram(bins=30, color="black",position = "identity") +
+  labs(title="Posterior Distribution of One-Dimensional Estimand") + xlab(TeX("$\\d(P^{(0)},P^{(1)})$")) + theme_bw()
+```
+
+
+```{r}
+bayesian_res[,3:5] %>% pivot_longer(cols = c("j = 2","j = 3","j = 4"), names_to = "delta", values_to = "values") %>%
+  ggplot(aes(x = values, colour= factor(delta), fill = factor(delta)))+geom_histogram(position = "identity",alpha = 0.3,bins=30,) +  
+  labs(title=TeX("$\\Posterior\\ Distribution \\ of\\  Delta_j$"),color=TeX("$\\Delta_j$"),fill=TeX("$\\Delta_j$"),x="propensity score") +
+  xlab(TeX("$\\Delta_j$")) + scale_fill_manual(values = c("#FF6666", "#00AFBB", "#E69F00")) + 
+  scale_color_manual(values = c("#FF6666", "#00AFBB", "#E69F00")) + theme_bw() 
+```
+
+
+references:
+1. Causal inference for ordinal outcomes https://arxiv.org/pdf/1501.01234.pdf
+2. Treatment Effects on Ordinal Outcomes: Causal Estimands and Sharp Bounds https://journals.sagepub.com/doi/pdf/10.3102/1076998618776435
+3. drug is not useful https://aasldpubs.onlinelibrary.wiley.com/doi/pdf/10.1002/hep.1840050613
+
+
+
+
+
+
+
